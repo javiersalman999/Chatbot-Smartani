@@ -1,0 +1,635 @@
+<!DOCTYPE html>
+<html lang="id">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Asisten Pertanian AI</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+        }
+
+        .container {
+            background: linear-gradient(135deg, #5cb85c 0%, #4cae4c 100%);
+            border-radius: 30px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+            max-width: 1100px;
+            width: 100%;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            height: 90vh;
+            /* Fixed height for chat scrolling */
+        }
+
+        .header {
+            padding: 20px 40px;
+            display: flex;
+            align-items: center;
+            gap: 20px;
+            flex-shrink: 0;
+        }
+
+        .logo {
+            width: 60px;
+            height: 60px;
+            background: rgba(255, 255, 255, 0.3);
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 30px;
+        }
+
+        .header-text h1 {
+            color: white;
+            font-size: 2em;
+            margin-bottom: 5px;
+        }
+
+        .header-text p {
+            color: rgba(255, 255, 255, 0.95);
+            font-size: 1em;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .status-dot {
+            width: 10px;
+            height: 10px;
+            background: #fff;
+            border-radius: 50%;
+            display: inline-block;
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+
+            0%,
+            100% {
+                opacity: 1;
+            }
+
+            50% {
+                opacity: 0.5;
+            }
+        }
+
+        .content {
+            background: #f5f5f5;
+            border-radius: 30px 30px 0 0;
+            padding: 30px 40px;
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            /* Important for inner scrolling */
+        }
+
+        /* Welcome Screen */
+        #welcome-screen {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            flex: 1;
+            transition: opacity 0.3s ease;
+        }
+
+        .greeting {
+            text-align: center;
+            margin-bottom: 40px;
+        }
+
+        .greeting h2 {
+            color: #333;
+            font-size: 2em;
+            margin-bottom: 10px;
+        }
+
+        .greeting .highlight {
+            color: #5cb85c;
+        }
+
+        .greeting-underline {
+            width: 400px;
+            height: 3px;
+            background: #333;
+            margin: 10px auto;
+        }
+
+        .buttons-container {
+            display: flex;
+            justify-content: center;
+            gap: 20px;
+            flex-wrap: wrap;
+            margin-bottom: 40px;
+        }
+
+        .suggestion-btn {
+            background: white;
+            border: 2px solid #ddd;
+            border-radius: 50px;
+            padding: 15px 30px;
+            font-size: 1em;
+            color: #333;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.1);
+        }
+
+        .suggestion-btn:hover {
+            background: #5cb85c;
+            color: white;
+            border-color: #5cb85c;
+            transform: translateY(-3px);
+            box-shadow: 0 6px 20px rgba(92, 184, 92, 0.3);
+        }
+
+        /* Chat Container */
+        #chat-container {
+            flex: 1;
+            overflow-y: auto;
+            padding: 20px;
+            display: none;
+            /* Hidden by default */
+            flex-direction: column;
+            gap: 20px;
+            margin-bottom: 20px;
+        }
+
+        .message {
+            max-width: 80%;
+            padding: 15px 20px;
+            border-radius: 20px;
+            line-height: 1.5;
+            position: relative;
+            word-wrap: break-word;
+        }
+
+        .user-message {
+            align-self: flex-end;
+            background: #5cb85c;
+            color: white;
+            border-bottom-right-radius: 5px;
+        }
+
+        .bot-message {
+            align-self: flex-start;
+            background: white;
+            color: #333;
+            border-bottom-left-radius: 5px;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.05);
+            white-space: pre-wrap;
+            /* Preserve formatting */
+        }
+
+        .loading-dots {
+            display: inline-block;
+        }
+
+        .loading-dots span {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            background: #ccc;
+            border-radius: 50%;
+            margin: 0 2px;
+            animation: bounce 1.4s infinite ease-in-out both;
+        }
+
+        .loading-dots span:nth-child(1) {
+            animation-delay: -0.32s;
+        }
+
+        .loading-dots span:nth-child(2) {
+            animation-delay: -0.16s;
+        }
+
+        @keyframes bounce {
+
+            0%,
+            80%,
+            100% {
+                transform: scale(0);
+            }
+
+            40% {
+                transform: scale(1);
+            }
+        }
+
+        /* Input Area */
+        .input-container {
+            display: flex;
+            gap: 15px;
+            align-items: center;
+            background: white;
+            border-radius: 50px;
+            padding: 10px 15px;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.1);
+            margin-top: auto;
+            /* Push to bottom */
+        }
+
+        .camera-btn {
+            width: 50px;
+            height: 50px;
+            background: #5cb85c;
+            border: none;
+            border-radius: 50%;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.3s ease;
+            flex-shrink: 0;
+            overflow: hidden;
+        }
+
+        .camera-btn img {
+            width: 24px;
+            height: 24px;
+            filter: brightness(0) invert(1);
+        }
+
+        .camera-btn:hover {
+            background: #4cae4c;
+            transform: scale(1.1);
+        }
+
+        .input-wrapper {
+            flex: 1;
+            position: relative;
+        }
+
+        .input-field {
+            width: 100%;
+            border: none;
+            outline: none;
+            font-size: 1.1em;
+            padding: 10px 15px;
+            color: #333;
+        }
+
+        .input-field::placeholder {
+            color: #999;
+        }
+
+        .send-btn {
+            width: 50px;
+            height: 50px;
+            background: #5cb85c;
+            border: none;
+            border-radius: 50%;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.3s ease;
+            flex-shrink: 0;
+        }
+
+        .send-btn img {
+            width: 24px;
+            height: 22px;
+            filter: brightness(0) invert(1);
+        }
+
+        .send-btn:hover {
+            background: #4cae4c;
+            transform: scale(1.1) rotate(45deg);
+        }
+
+        .mic-btn {
+            width: 50px;
+            height: 50px;
+            background: #5cb85c;
+            border: none;
+            border-radius: 50%;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.3s ease;
+            flex-shrink: 0;
+        }
+
+        .mic-btn img {
+            width: 24px;
+            height: 24px;
+            filter: brightness(0) invert(1);
+        }
+
+        .mic-btn:hover {
+            background: #4cae4c;
+            transform: scale(1.1);
+        }
+
+        .mic-btn.listening {
+            background: #d9534f;
+            animation: pulse-red 1.5s infinite;
+        }
+
+        @keyframes pulse-red {
+            0% {
+                box-shadow: 0 0 0 0 rgba(217, 83, 79, 0.7);
+            }
+
+            70% {
+                box-shadow: 0 0 0 10px rgba(217, 83, 79, 0);
+            }
+
+            100% {
+                box-shadow: 0 0 0 0 rgba(217, 83, 79, 0);
+            }
+        }
+
+        @media (max-width: 768px) {
+            .header-text h1 {
+                font-size: 1.5em;
+            }
+
+            .greeting h2 {
+                font-size: 1.5em;
+            }
+
+            .buttons-container {
+                flex-direction: column;
+                align-items: stretch;
+            }
+
+            .suggestion-btn {
+                width: 100%;
+            }
+
+            .greeting-underline {
+                width: 100%;
+            }
+        }
+    </style>
+</head>
+
+<body>
+    <div class="container">
+        <div class="header">
+            <div class="logo">
+                <img src="LogoSmartani.png" alt="Smartani Logo"
+                    style="width: 100%; height: 100%; object-fit: contain; border-radius: 50%;">
+            </div>
+            <div class="header-text">
+                <h1>SMARTANI AI</h1>
+                <p><span class="status-dot"></span> Online dan Siap Membantu Anda</p>
+            </div>
+        </div>
+
+        <div class="content">
+            <!-- Welcome Screen -->
+            <div id="welcome-screen">
+                <div class="greeting">
+                    <h2>Halo Petani! Saya Siap Membantu<br>Masalah <span class="highlight">Pertanian</span> Anda</h2>
+                    <div class="greeting-underline"></div>
+                </div>
+
+                <div class="buttons-container">
+                    <button class="suggestion-btn" onclick="sendSuggestion('Bagaimana Tips Pemupukan?')">
+                        Bagaimana Tips Pemupukan?
+                    </button>
+                    <button class="suggestion-btn" onclick="sendSuggestion('Cara Menanam Padi?')">
+                        Cara Menanam Padi?
+                    </button>
+                    <button class="suggestion-btn" onclick="sendSuggestion('Cara Mengatasi Hama?')">
+                        Cara Mengatasi Hama?
+                    </button>
+                </div>
+            </div>
+
+            <!-- Chat Container -->
+            <div id="chat-container"></div>
+
+            <!-- Input Area -->
+            <div class="input-container">
+                <input type="file" id="fileInput" style="display: none;" accept="image/*,application/pdf">
+                <button class="camera-btn" id="uploadBtn" title="Upload File">
+                    <span style="font-size: 24px; color: white;">+</span>
+                </button>
+                <div class="input-wrapper">
+                    <div id="filePreview" style="display: none; font-size: 0.8em; color: #5cb85c; margin-bottom: 5px;">
+                        <span id="fileName"></span> <span id="removeFile"
+                            style="cursor: pointer; color: red;">(x)</span>
+                    </div>
+                    <input type="text" class="input-field" id="questionInput"
+                        placeholder="Tanyakan Tentang Pertanian.........." autocomplete="off">
+                </div>
+                <button class="mic-btn" id="micBtn" title="Voice Command">
+                    <!-- Icon Mic Sederhana -->
+                    <img src="https://img.icons8.com/ios-filled/50/ffffff/microphone.png" alt="Mic"
+                        onerror="this.style.display='none'; this.parentNode.innerHTML='🎤'">
+                </button>
+                <button class="send-btn" id="sendBtn">
+                    <img src="send.png" alt="Send" onerror="this.style.display='none'; this.parentNode.innerHTML='➤'">
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const questionInput = document.getElementById('questionInput');
+        const sendBtn = document.getElementById('sendBtn');
+        const chatContainer = document.getElementById('chat-container');
+        const welcomeScreen = document.getElementById('welcome-screen');
+        const fileInput = document.getElementById('fileInput');
+        const uploadBtn = document.getElementById('uploadBtn');
+        const filePreview = document.getElementById('filePreview');
+        const fileNameSpan = document.getElementById('fileName');
+        const removeFileSpan = document.getElementById('removeFile');
+        const micBtn = document.getElementById('micBtn');
+
+        let sessionId = 'session_' + Date.now();
+        let selectedFile = null;
+
+        function switchToChat() {
+            welcomeScreen.style.display = 'none';
+            chatContainer.style.display = 'flex';
+        }
+
+        function appendMessage(text, type) {
+            const msgDiv = document.createElement('div');
+            msgDiv.className = `message ${type}-message`;
+
+            // Simple URL linking
+            const urlRegex = /(https?:\/\/[^\s]+)/g;
+            const formattedText = text.replace(urlRegex, '<a href="$1" target="_blank" style="color: inherit; text-decoration: underline;">$1</a>');
+
+            msgDiv.innerHTML = formattedText;
+            chatContainer.appendChild(msgDiv);
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+        }
+
+        function showLoading() {
+            const loadingDiv = document.createElement('div');
+            loadingDiv.className = 'message bot-message loading-message';
+            loadingDiv.innerHTML = '<div class="loading-dots"><span></span><span></span><span></span></div>';
+            chatContainer.appendChild(loadingDiv);
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+            return loadingDiv;
+        }
+
+        // File Upload Handling
+        uploadBtn.addEventListener('click', () => fileInput.click());
+
+        fileInput.addEventListener('change', (e) => {
+            if (e.target.files.length > 0) {
+                selectedFile = e.target.files[0];
+                fileNameSpan.textContent = selectedFile.name;
+                filePreview.style.display = 'block';
+            }
+        });
+
+        removeFileSpan.addEventListener('click', () => {
+            selectedFile = null;
+            fileInput.value = '';
+            filePreview.style.display = 'none';
+        });
+
+        async function sendMessage(text) {
+            if (!text.trim() && !selectedFile) return;
+
+            // Check if running from file
+            if (window.location.protocol === 'file:') {
+                alert("PERINGATAN: Anda membuka file ini langsung. Mohon jalankan 'python app.py' dan buka 'http://localhost:5000' di browser untuk fungsi penuh.");
+            }
+
+            switchToChat();
+
+            let displayMsg = text;
+            if (selectedFile) {
+                displayMsg = `[File: ${selectedFile.name}]<br>${text}`;
+            }
+            appendMessage(displayMsg, 'user');
+
+            questionInput.value = '';
+            // Don't clear file immediately if we want to support retries, but standard chat usually clears
+            const currentFile = selectedFile;
+
+            // Clear input UI
+            selectedFile = null;
+            fileInput.value = '';
+            filePreview.style.display = 'none';
+
+            const loadingDiv = showLoading();
+
+            try {
+                // Determine API URL
+                let apiUrl = '/api/chat';
+                if (window.location.protocol === 'file:') {
+                    apiUrl = 'http://127.0.0.1:5000/api/chat';
+                }
+
+                // Use FormData for file upload
+                const formData = new FormData();
+                formData.append('message', text);
+                formData.append('session_id', sessionId);
+                if (currentFile) {
+                    formData.append('file', currentFile);
+                }
+
+                const response = await fetch(apiUrl, {
+                    method: 'POST',
+                    body: formData // Fetch automatically sets Content-Type to multipart/form-data
+                });
+
+                const data = await response.json();
+
+                // Remove loading
+                chatContainer.removeChild(loadingDiv);
+
+                if (data.error) {
+                    appendMessage('Maaf, terjadi kesalahan: ' + data.error, 'bot');
+                } else {
+                    appendMessage(data.response, 'bot');
+                }
+
+            } catch (error) {
+                chatContainer.removeChild(loadingDiv);
+                appendMessage('Maaf, tidak dapat terhubung ke server. Pastikan Anda sudah menjalankan "python app.py" di terminal.', 'bot');
+                console.error('Error:', error);
+            }
+        }
+
+        function sendSuggestion(text) {
+            sendMessage(text);
+        }
+
+        // Event Listeners
+        sendBtn.addEventListener('click', () => sendMessage(questionInput.value));
+
+        questionInput.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') {
+                sendMessage(questionInput.value);
+            }
+        });
+
+        // Voice Command Logic
+        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+
+        if (SpeechRecognition) {
+            const recognition = new SpeechRecognition();
+            recognition.lang = 'id-ID'; // Bahasa Indonesia
+            recognition.interimResults = false;
+            recognition.maxAlternatives = 1;
+
+            micBtn.addEventListener('click', () => {
+                if (micBtn.classList.contains('listening')) {
+                    recognition.stop();
+                } else {
+                    recognition.start();
+                }
+            });
+
+            recognition.onstart = () => {
+                micBtn.classList.add('listening');
+                questionInput.placeholder = "Mendengarkan...";
+            };
+
+            recognition.onend = () => {
+                micBtn.classList.remove('listening');
+                questionInput.placeholder = "Tanyakan Tentang Pertanian..........";
+            };
+
+            recognition.onresult = (event) => {
+                const transcript = event.results[0][0].transcript;
+                questionInput.value = transcript;
+                // Optional: Auto send after voice
+                // sendMessage(transcript); 
+            };
+
+            recognition.onerror = (event) => {
+                console.error('Speech recognition error', event.error);
+                micBtn.classList.remove('listening');
+                questionInput.placeholder = "Error mic. Coba ketik manual.";
+                setTimeout(() => {
+                    questionInput.placeholder = "Tanyakan Tentang Pertanian..........";
+                }, 3000);
+            };
+        } else {
+            micBtn.style.display = 'none';
+            console.log("Web Speech API not supported in this browser.");
+        }
+    </script>
+</body>
+
+</html>
