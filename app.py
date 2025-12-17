@@ -1,455 +1,587 @@
-from flask import Flask, render_template, request, jsonify, send_from_directory
+from dotenv import load_dotenv
 import os
-import sys
-import time
-import google.generativeai as genai
-
-# ==========================================
-# KONFIGURASI
-# ==========================================
-# API KEY ROTATION POOL
-# Tambahkan key cadangan di sini. Sistem akan otomatis ganti jika limit habis.
-API_KEYS = [
-    "AIzaSyBoIBCKcUwd-E9yuJtlubSgRHXYoYGvV4M", # Primary Key (New)
-    "AIzaSyCkgId9TQjFKYUmW_UfnS3SfB88K3sIh4U", # Backup Key (Old)
-]
-CURRENT_KEY_INDEX = 0
-
-# DATASET_FILE = "dataset.xlsx" # Tidak digunakan lagi
-MODEL_NAME = "gemini-2.5-flash"
-
-# Database Configuration
-DB_CONFIG = {
-    'host': '127.0.0.1',
-    'user': 'root', 
-    'password': '',
-    'database': 'u979757278_smartani'
-}
-
-# Initialize Flask App
-app = Flask(__name__, template_folder='.', static_folder='.')
+from flask import Flask, request, jsonify, send_from_directory, url_for
 from flask_cors import CORS
+from werkzeug.utils import secure_filename
+import google.generativeai as genai
+import json
+import time
+import re
+from datetime import datetime
+import logging
+import zipfile
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Load environment variables
+load_dotenv()
+
+# API Configuration
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+app = Flask(__name__)
 CORS(app)
 
-# ==========================================
-# LAYER 1: LOCAL INTELLIGENCE (GEMINI + MySQL)
-# ==========================================
-SYSTEM_INSTRUCTION = """
-ANDA ADALAH SCIENTIFIC AGRIBOT.
-TUGAS: Jawab pertanyaan user berdasarkan DATASET yang diberikan.
+# Upload config
+UPLOAD_FOLDER = os.path.join(os.path.dirname(__file__), 'uploads')
+# Keep a set of document extensions allowed; images and videos are allowed by mimetype
+ALLOWED_EXTENSIONS = {
+    'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'txt', 'csv', 'rtf', 'odt', 'zip'
+}
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+# Allow up to 20 MB uploads
+app.config['MAX_CONTENT_LENGTH'] = 20 * 1024 * 1024  # 20 MB
 
-ATURAN KRUSIAL (STRICT MODE):
-1. Cek apakah jawaban SPESIFIK untuk kasus user ada di DATASET.
-2. JIKA pertanyaan user mengandung detail spesifik (seperti ukuran tanah "200m x 100m", lokasi detail "jauh dari pantai dan gunung") DAN dataset TIDAK memuat artikel yang membahas kasus persis tersebut: Jawab "SEARCH_EXTERNAL".
-3. JANGAN MENCOCOK-COCOKKAN data umum (misal: hanya ada data "padi", lalu anda menyarankan padi untuk kasus spesifik user padahal tidak ada kaitan langsung di teks). ITU DILARANG.
-4. JIKA ADA data yang relevan dan LANGSUNG menjawab pertanyaan tanpa asumsi: Jawab dengan ringkas dan sertakan sumbernya.
-5. JIKA TIDAK ADA: Jawab HANYA dengan satu kata: "SEARCH_EXTERNAL".
-   (Jangan minta maaf, jangan basa-basi, jangan bilang "tidak tahu". Cukup "SEARCH_EXTERNAL").
 
-Fokus: Akurasi data lokal adalah prioritas utama. Jangan memaksakan jawaban lokal jika tidak pas.
-"""
+@app.errorhandler(413)
+def request_entity_too_large(error):
+    logger.warning('Upload melebihi batas MAX_CONTENT_LENGTH')
+    return jsonify({'success': False, 'response': 'File terlalu besar. Maksimum 20MB.'}), 413
 
-# Global variables for model and chat session
-model = None
-chat_session = None
-dataset_context = ""
 
-def check_dependencies():
-    """Memastikan library terinstall."""
-    required = ['pandas', 'openpyxl', 'requests', 'google-generativeai', 'flask', 'mysql-connector-python']
-    missing = []
-    for lib in required:
-        try:
-            if lib == 'mysql-connector-python':
-                import mysql.connector
-            else:
-                __import__(lib.replace('-', '_')) # handle google-generativeai -> google_generativeai
-        except ImportError:
-            # Special case for google-generativeai which is imported as google.generativeai
-            if lib == 'google-generativeai':
-                try:
-                    import google.generativeai
-                except ImportError:
-                    missing.append(lib)
-            else:
-                missing.append(lib)
-    
-    if missing:
-        print(f"[ERROR] Library kurang: {', '.join(missing)}")
-        print(f"Run: pip install {' '.join(missing)}")
-        pass 
-
-def load_from_mysql():
-    """Membaca data dari database MySQL dan mengubahnya menjadi string context."""
-    import mysql.connector
-    
-    print(f"[MYSQL] Connecting to {DB_CONFIG['host']}...")
+def allowed_file(file_storage_or_name):
+    """Accept any image/* or video/* MIME type, or allow certain document extensions.
+    Accepts a Werkzeug FileStorage or a filename string.
+    """
+    # If a FileStorage is passed, inspect its mimetype first
+    mimetype = None
     try:
-        conn = mysql.connector.connect(**DB_CONFIG)
-        cursor = conn.cursor(dictionary=True)
-        
-        # Select important columns from chatbot_dataset
-        query = "SELECT judul, ringkasan, isi_artikel FROM chatbot_dataset"
-        cursor.execute(query)
-        rows = cursor.fetchall()
-        
-        if not rows:
-            print("[MYSQL] Warning: Table 'chatbot_dataset' is empty.")
-            return ""
+        mimetype = getattr(file_storage_or_name, 'mimetype', None)
+    except Exception:
+        mimetype = None
 
-        # Konversi ke format teks yang mudah dibaca LLM
-        text_data = ""
-        for i, row in enumerate(rows):
-            text_data += f"--- DATA {i+1} ---\n"
-            text_data += f"JUDUL: {row['judul']}\n"
-            text_data += f"RINGKASAN: {row['ringkasan']}\n"
-            text_data += f"ISI: {row['isi_artikel']}\n"
-            text_data += "\n"
-            
-        print(f"[MYSQL] Successfully loaded {len(rows)} records.")
-        cursor.close()
-        conn.close()
-        return text_data
-        
-    except mysql.connector.Error as err:
-        print(f"[ERROR] MySQL Error: {err}")
-        print("Pastikan XAMPP/MySQL berjalan dan database 'u979757278_smartani' sudah dibuat.")
-        return ""
-    except Exception as e:
-        print(f"[ERROR] Gagal baca database: {e}")
-        return ""
+    if mimetype and isinstance(mimetype, str):
+        if mimetype.startswith('image/') or mimetype.startswith('video/'):
+            return True
 
-# ==========================================
-# HELPER: RETRY MECHANISM & KEY ROTATION
-# ==========================================
-def rotate_key():
-    """Mengganti API Key aktif ke key berikutnya dalam list."""
-    global CURRENT_KEY_INDEX
-    CURRENT_KEY_INDEX = (CURRENT_KEY_INDEX + 1) % len(API_KEYS)
-    new_key = API_KEYS[CURRENT_KEY_INDEX]
-    
-    # Validasi key placeholder
-    if "INPUT_API_KEY" in new_key:
-        print(f"\n[ROTATION] Warning: Key indek {CURRENT_KEY_INDEX} masih placeholder. Melewati...")
-        return rotate_key() # Rekursif cari key berikutnya yang valid
-        
-    print(f"\n[ROTATION] Mengganti ke API Key indek {CURRENT_KEY_INDEX}...")
-    genai.configure(api_key=new_key)
-    return True
+    # Fallback: check extension from filename
+    if isinstance(file_storage_or_name, str):
+        filename = file_storage_or_name
+    else:
+        filename = getattr(file_storage_or_name, 'filename', '')
 
-def generate_with_retry(func, *args, **kwargs):
-    """Wrapper untuk retry otomatis dengan rotasi key jika kena limit."""
-    max_retries = 5
-    base_wait = 5 # Detik, dipercepat karena ada rotasi
-    
-    for attempt in range(max_retries):
+    if not filename:
+        return False
+
+    ext = filename.rsplit('.', 1)[-1].lower() if '.' in filename else ''
+    return ext in ALLOWED_EXTENSIONS
+
+
+class MultiLayerChatbot:
+    def __init__(self, api_key):
+        if not api_key:
+            raise ValueError("GEMINI_API_KEY tidak boleh kosong!")
+        
+        genai.configure(api_key=api_key)
+        
+        logger.info("Mencari model Gemini yang tersedia...")
+        available_models = []
+        
         try:
-            return func(*args, **kwargs)
+            for m in genai.list_models():
+                if 'generateContent' in m.supported_generation_methods:
+                    available_models.append(m.name)
+                    logger.info(f"Model tersedia: {m.name}")
         except Exception as e:
-            error_str = str(e).lower()
-            if "429" in error_str or "quota" in error_str or "resource exhausted" in error_str:
-                print(f"\n[QUOTA] API Limit reached on key index {CURRENT_KEY_INDEX}.")
-                
-                # Coba rotasi key
-                if len(API_KEYS) > 1:
-                    try:
-                        rotate_key()
-                        print("[RETRY] Mencoba ulang segera dengan key baru...")
-                        continue # Langsung retry tanpa sleep lama
-                    except RecursionError:
-                         print("[ROTATION] Semua key sepertinya habis/invalid.")
-                
-                # Jika hanya 1 key atau semua key habis, fallback ke sleep
-                wait_time = base_wait * (2 ** attempt)
-                print(f"[WAIT] Menunggu {wait_time} detik...")
-                time.sleep(wait_time)
-            else:
-                raise e 
-                
-    raise Exception("Gagal: Seluruh API Key limit dan max retries terlampaui.")
-
-# ==========================================
-# LAYER 2: EXTERNAL INTELLIGENCE (SEMANTIC SCHOLAR)
-# ==========================================
-def synthesize_external_data(query, papers):
-    """Menggunakan Gemini untuk menyimpulkan hasil pencarian eksternal."""
-    try:
-        # Format data untuk prompt
-        context_text = ""
-        for i, p in enumerate(papers):
-            context_text += f"Jurnal {i+1}: {p['title']}\nAbstrak: {p.get('abstract', 'Tidak ada abstrak')}\n\n"
-
-        prompt = f"""
-        TUGAS: Jawab pertanyaan user berdasarkan ringkasan jurnal ilmiah di bawah ini.
+            logger.error(f"Error listing models: {e}")
         
-        PERTANYAAN: {query}
+        if not available_models:
+            raise ValueError("Tidak ada model yang tersedia. Periksa API key!")
         
-        DATA JURNAL:
-        {context_text}
+        model_name = available_models[0].replace('models/', '')
         
-        INSTRUKSI:
-        1. Buat KESIMPULAN KOMPREHENSIF yang menjawab pertanyaan.
-        2. Jangan menyebutkan "Berdasarkan jurnal 1...", langsung saja rangkum isinya menjadi satu narasi ilmiah.
-        3. Bahasa Indonesia formal & ilmiah.
-        """
-        
-        # Gunakan model yang sama dengan konfigurasi global
-        model_synth = genai.GenerativeModel(MODEL_NAME)
-        # response = model_synth.generate_content(prompt)
-        response = generate_with_retry(model_synth.generate_content, prompt)
-        return response.text.strip()
-    except Exception as e:
-        return f"[Error Synthesis] Gagal menyimpulkan data: {e}"
-
-def optimize_search_query(user_query, session_context=None):
-    """Mengubah pertanyaan user yang kompleks menjadi keyword pencarian efektif."""
-    try:
-        # Jika ada konteks sebelumnya, tambahkan sebagai konteks untuk follow-up
-        context_hint = ""
-        if session_context and session_context.get("first_question"):
-            context_hint = f"""
-        
-        KONTEKS PERCAKAPAN SEBELUMNYA:
-        - Pertanyaan awal: {session_context['first_question']}
-        - Jawaban singkat: {session_context['first_answer'][:200] if session_context.get('first_answer') else 'N/A'}
-        
-        INSTRUKSI TAMBAHAN: Jika pertanyaan saat ini adalah follow-up dari pertanyaan awal, AUGMENT keyword dengan detail dari konteks sebelumnya (mis: jenis tanaman, ukuran lahan, lokasi, modal, dst) agar hasil pencarian tetap RELEVAN ke kasus spesifik user, bukan generic."""
-        
-        prompt = f"""
-        TUGAS: Ekstrak keyword pencarian untuk Semantic Scholar (database jurnal ilmiah) dari pertanyaan user.
-        
-        PERTANYAAN USER: "{user_query}"{context_hint}
-        
-        ATURAN:
-        1. Ambil inti topik ilmiahnya saja.
-        2. Buang kata-kata sambung atau detail angka yang tidak relevan untuk PENCARIAN JUDUL JURNAL (tapi detail angka penting untuk jawaban akhir nanti).
-        3. Utamakan istilah bahasa Inggris jika topiknya umum, atau Indonesia jika spesifik lokal.
-        4. Output HANYA string keyword. Jangan ada penjelasan lain.
-        
-        CONTOH:
-        Input: "Tanaman apa yang cocok untuk lahan gambut yang asam?"
-        Output: peatland agriculture crops acid soil
-        
-        Input: "{user_query}"
-        Output:
-        """
-        model_opt = genai.GenerativeModel(MODEL_NAME)
-        # response = model_opt.generate_content(prompt)
-        response = generate_with_retry(model_opt.generate_content, prompt)
-        return response.text.strip()
-    except Exception as e:
-        print(f"[Warning] Gagal optimasi query: {e}")
-        return user_query
-
-def search_semantic_scholar(original_query, session_context=None):
-    """Mencari jurnal ilmiah jika data lokal tidak ada."""
-    import requests
-    import time
-    
-    # 1. Optimasi Query (Natural Language -> Keywords)
-    search_keywords = optimize_search_query(original_query, session_context)
-    print(f"\n[LAYER 2] Mencari di Semantic Scholar: '{search_keywords}'...")
-    
-    url = "https://api.semanticscholar.org/graph/v1/paper/search"
-    params = {
-        "query": search_keywords,
-        "limit": 5,
-        "fields": "title,authors,year,abstract,url"
-    }
-    
-    max_retries = 3
-    for attempt in range(max_retries):
         try:
-            response = requests.get(url, params=params, timeout=10)
+            self.model = genai.GenerativeModel(model_name)
+            logger.info(f"Chatbot berhasil diinisialisasi dengan {model_name}")
+        except Exception as e:
+            raise ValueError(f"Gagal inisialisasi model {model_name}: {e}")
+        
+        self.chat_history = []
+        self.conversation_memory = []  # Memory untuk context
+        self.model_name = model_name
+    
+    def get_available_models(self):
+        try:
+            models = genai.list_models()
+            available = []
+            for model in models:
+                if 'generateContent' in model.supported_generation_methods:
+                    available.append({
+                        'name': model.name,
+                        'display_name': model.display_name,
+                        'description': model.description[:100] if model.description else 'N/A'
+                    })
+            return available
+        except Exception as e:
+            logger.error(f"Error listing models: {e}")
+            return []
+    
+    def search_scholarly(self, query, max_results=3):
+        try:
+            from scholarly import scholarly
+            import socket
             
-            if response.status_code == 200:
-                data = response.json()
-                papers = data.get('data', [])
-                
-                if not papers:
-                    return f"[LAYER 2] Tidak ditemukan jurnal terkait untuk kata kunci: '{search_keywords}'."
-                
-                # --- SYNTHESIS STEP ---
-                synthesis = synthesize_external_data(original_query, papers)
-                
-                # --- FORMAT OUTPUT ---
-                result_text = f"\n=== KESIMPULAN ILMIAH (External) ===\n{synthesis}\n"
-                result_text += "\n=== REFERENSI SUMBER ===\n"
-                
-                for i, paper in enumerate(papers):
-                    title = paper.get('title', 'No Title')
-                    year = paper.get('year', 'N/A')
-                    url_link = paper.get('url', '-')
+            original_timeout = socket.getdefaulttimeout()
+            socket.setdefaulttimeout(10)
+            
+            logger.info(f"Mencari di Google Scholar: {query}")
+            search_query = scholarly.search_pubs(query)
+            results = []
+            
+            for i, pub in enumerate(search_query):
+                if i >= max_results:
+                    break
                     
-                    # Format Authors
-                    authors = paper.get('authors', [])
-                    author_names = ", ".join([a['name'] for a in authors[:3]]) # Ambil 3 penulis pertama
-                    if len(authors) > 3: author_names += " et al."
-
-                    result_text += f"[{i+1}] {title} ({year}) - {author_names}\n"
-                    result_text += f"    Link: {url_link}\n"
-                
-                return result_text
+                bib = pub.get('bib', {})
+                results.append({
+                    'title': bib.get('title', 'N/A'),
+                    'author': ', '.join(bib.get('author', [])) if isinstance(bib.get('author'), list) else bib.get('author', 'N/A'),
+                    'year': bib.get('pub_year', 'N/A'),
+                    'abstract': bib.get('abstract', 'N/A'),
+                    'citations': pub.get('num_citations', 0),
+                    'venue': bib.get('venue', 'N/A')
+                })
             
-            elif response.status_code == 429:
-                wait_time = (attempt + 1) * 2 # 2s, 4s, 6s
-                time.sleep(wait_time)
-                continue
-                
-            else:
-                return f"[LAYER 2] Gagal menghubungi API (Status: {response.status_code})"
-                
+            socket.setdefaulttimeout(original_timeout)
+            logger.info(f"Ditemukan {len(results)} referensi akademik")
+            return results
+            
+        except ImportError:
+            logger.warning("Module scholarly tidak terinstall")
+            return []
         except Exception as e:
-            return f"[LAYER 2] Error koneksi: {e}"
+            logger.error(f"Error saat mencari di Scholar: {str(e)}")
+            return []
+    
+    def build_conversation_context(self):
+        """Build context dari conversation history"""
+        if not self.conversation_memory:
+            return ""
+        
+        # Ambil max 3 percakapan terakhir saja (lebih fokus)
+        recent_convs = self.conversation_memory[-3:]
+        
+        context = "\n\nKONTEKS PERCAKAPAN SEBELUMNYA (untuk referensi saja):\n"
+        
+        for idx, conv in enumerate(recent_convs, 1):
+            # Potong response yang terlalu panjang
+            assistant_text = conv['assistant'][:200]
+            if len(conv['assistant']) > 200:
+                assistant_text += "..."
             
-    return "[LAYER 2] Gagal: Terlalu banyak permintaan (Rate Limit Exceeded)."
+            context += f"\n[{idx}] User bertanya: {conv['user']}\n"
+            context += f"    Kamu jawab: {assistant_text}\n"
+        
+        context += "\n(Gunakan konteks di atas HANYA jika pertanyaan baru merujuk ke percakapan sebelumnya)\n"
+        context += "---\n"
+        return context
+    
+    def create_enhanced_prompt(self, user_query, scholar_data):
+        scholar_context = ""
+        
+        if scholar_data:
+            scholar_context = "\n\nDATA REFERENSI AKADEMIK:\n"
+            for idx, paper in enumerate(scholar_data, 1):
+                scholar_context += f"\n[Referensi {idx}]\n"
+                scholar_context += f"Judul: {paper['title']}\n"
+                scholar_context += f"Penulis: {paper['author']}\n"
+                scholar_context += f"Tahun: {paper['year']}\n"
+                
+                if paper['venue'] != 'N/A':
+                    scholar_context += f"Publikasi: {paper['venue']}\n"
+                
+                if paper['abstract'] != 'N/A':
+                    abstract = paper['abstract'][:500]
+                    scholar_context += f"Abstrak: {abstract}...\n"
+                
+                scholar_context += f"Sitasi: {paper['citations']}\n"
+        
+        # Build conversation context
+        conversation_context = self.build_conversation_context()
+        
+        prompt = f"""Kamu adalah asisten AI pertanian yang cerdas dan membantu. Kamu berbicara dengan gaya natural dan santai seperti teman.
 
-# ==========================================
-# FLASK ROUTES
-# ==========================================
+PERSONA DAN TONE:
+- Panggil user dengan "kamu" (bukan Bapak/Ibu/Anda)
+- Gunakan bahasa yang friendly dan approachable
+- Seperti kakak yang care dan mau bantu
+- Tetap profesional tapi tidak kaku
+- Hangat dan supportif
 
+PENTING - ATURAN FORMATTING:
+- JANGAN gunakan markdown formatting seperti **bold**, *italic*, atau ### headers
+- JANGAN gunakan bullet points dengan bintang (*)
+- Tulis dalam paragraf natural seperti sedang berbicara
+- Gunakan angka (1, 2, 3) atau dash (-) untuk list jika memang perlu
+- Pisahkan topik dengan baris kosong, bukan dengan header berbintang
+- Tulis teks polos biasa, natural seperti chat
+
+CARA MENJAWAB:
+- Fokus HANYA pada pertanyaan terakhir yang baru ditanyakan
+- Jangan jawab ulang pertanyaan lama dari history
+- Gunakan context sebelumnya HANYA jika pertanyaan baru merujuknya (misal: "yang tadi", "poin nomor 2", "itu maksudnya gimana")
+- Jika pertanyaan baru sama sekali berbeda dari history, jawab fresh tanpa nyambung-nyambungin
+- Gunakan bahasa yang santai tapi informatif
+- Tulis seperti sedang menjelaskan ke teman
+- Berikan informasi yang akurat dan faktual
+- Jika ada data dari referensi, sebutkan dengan natural
+- Berikan contoh konkret agar mudah dipahami
+- Fokus pada solusi praktis untuk petani
+
+{conversation_context}
+
+{scholar_context}
+
+PERTANYAAN BARU DARI USER (FOKUS JAWAB INI): {user_query}
+
+Jawab dengan natural, informatif, dan helpful. Ingat: JANGAN pakai format markdown apapun! Jawab dengan gaya ngobrol santai tapi tetap memberikan info yang berguna. FOKUS HANYA PADA PERTANYAAN TERAKHIR!"""
+
+        return prompt
+    
+    def clean_response_text(self, text):
+        """Membersihkan text dari formatting markdown"""
+        cleaned = text
+        
+        # Hapus bold markdown (**text**)
+        cleaned = re.sub(r'\*\*([^*]+)\*\*', r'\1', cleaned)
+        
+        # Hapus italic markdown (*text*)
+        cleaned = re.sub(r'(?<!\*)\*(?!\*)([^*]+)\*(?!\*)', r'\1', cleaned)
+        
+        # Hapus headers markdown (### text)
+        cleaned = re.sub(r'^#{1,6}\s+', '', cleaned, flags=re.MULTILINE)
+        
+        # Replace bullet points dengan dash
+        cleaned = cleaned.replace('\n*   ', '\n- ')
+        cleaned = cleaned.replace('\n* ', '\n- ')
+        cleaned = cleaned.replace('\n• ', '\n- ')
+        
+        # Bersihkan multiple newlines (max 2 baris kosong)
+        cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+        
+        # Trim whitespace di awal dan akhir
+        cleaned = cleaned.strip()
+        
+        return cleaned
+    
+    def get_response(self, user_query, use_scholar=False):
+        scholar_data = []
+        start_time = time.time()
+        
+        if use_scholar:
+            try:
+                scholar_data = self.search_scholarly(user_query)
+            except Exception as e:
+                logger.error(f"Error pada Scholar search: {e}")
+        
+        enhanced_prompt = self.create_enhanced_prompt(user_query, scholar_data)
+        
+        try:
+            logger.info("Gemini sedang memproses...")
+            
+            response = self.model.generate_content(
+                enhanced_prompt,
+                generation_config=genai.types.GenerationConfig(
+                    temperature=0.7,
+                    top_p=0.95,
+                    top_k=40,
+                    max_output_tokens=2048,
+                )
+            )
+            
+            if not response or not response.text:
+                raise ValueError("Response kosong dari Gemini")
+            
+            # Clean formatting
+            cleaned_text = self.clean_response_text(response.text)
+            
+            # Simpan ke conversation memory
+            self.conversation_memory.append({
+                'user': user_query,
+                'assistant': cleaned_text,
+                'timestamp': datetime.now().isoformat()
+            })
+            
+            processing_time = time.time() - start_time
+            
+            # Simpan ke chat history (untuk logging)
+            self.chat_history.append({
+                'timestamp': datetime.now().isoformat(),
+                'query': user_query,
+                'scholar_refs': len(scholar_data),
+                'response': cleaned_text,
+                'processing_time': round(processing_time, 2)
+            })
+            
+            logger.info(f"Response berhasil ({processing_time:.2f}s)")
+            
+            return {
+                'success': True,
+                'response': cleaned_text,
+                'scholar_data': scholar_data,
+                'has_references': len(scholar_data) > 0,
+                'references_count': len(scholar_data),
+                'processing_time': round(processing_time, 2),
+                'conversation_length': len(self.conversation_memory)
+            }
+            
+        except Exception as e:
+            logger.error(f"Error saat generate response: {str(e)}")
+            return {
+                'success': False,
+                'response': f"Maaf, terjadi kesalahan: {str(e)}",
+                'scholar_data': [],
+                'has_references': False,
+                'error': str(e)
+            }
+    
+    def clear_history(self):
+        self.chat_history = []
+        self.conversation_memory = []
+        logger.info("Riwayat chat dan memory telah dihapus")
+    
+    def export_history(self, filename='chat_history.json'):
+        try:
+            export_data = {
+                'chat_history': self.chat_history,
+                'conversation_memory': self.conversation_memory,
+                'exported_at': datetime.now().isoformat()
+            }
+            with open(filename, 'w', encoding='utf-8') as f:
+                json.dump(export_data, f, ensure_ascii=False, indent=2)
+            logger.info(f"History exported to {filename}")
+            return filename
+        except Exception as e:
+            logger.error(f"Error exporting history: {e}")
+            raise
+
+
+# Initialize chatbot
+chatbot = None
+
+try:
+    if GEMINI_API_KEY:
+        chatbot = MultiLayerChatbot(GEMINI_API_KEY)
+    else:
+        logger.error("GEMINI_API_KEY tidak ditemukan!")
+except Exception as e:
+    logger.error(f"Error inisialisasi chatbot: {e}")
+
+
+# Flask Routes
 @app.route('/')
-def index():
-    return send_from_directory('.', 'smartani.html')
+def home():
+    try:
+        return send_from_directory('.', 'smartani.html')
+    except FileNotFoundError:
+        return jsonify({'error': 'smartani.html tidak ditemukan'}), 404
 
-@app.route('/<path:path>')
-def serve_static(path):
-    return send_from_directory('.', path)
 
-# Session storage (simple in-memory for demo purposes)
-# In production, use a proper session management or database
-sessions = {}
+@app.route('/<path:filename>')
+def serve_static(filename):
+    try:
+        return send_from_directory('.', filename)
+    except FileNotFoundError:
+        return jsonify({'error': f'File {filename} tidak ditemukan'}), 404
+
 
 @app.route('/api/chat', methods=['POST'])
 def chat():
-    global chat_session, dataset_context
+    if not chatbot:
+        return jsonify({
+            'success': False,
+            'response': 'Chatbot belum diinisialisasi. Periksa GEMINI_API_KEY'
+        }), 500
     
-    # Handle multipart/form-data or JSON
-    user_input = ""
-    session_id = "default"
-    uploaded_file = None
-
-    if request.content_type.startswith('multipart/form-data'):
-        user_input = request.form.get('message', '')
-        session_id = request.form.get('session_id', 'default')
-        if 'file' in request.files:
-            uploaded_file = request.files['file']
-    else:
-        data = request.json
-        user_input = data.get('message', '')
-        session_id = data.get('session_id', 'default')
-    
-    if not user_input and not uploaded_file:
-        return jsonify({"error": "No message or file provided"}), 400
-
-    # Initialize session if needed
-    if session_id not in sessions:
-        sessions[session_id] = {
-            "first_question": None,
-            "first_answer": None,
-            "conversation_count": 0,
-            "history": [
-                {"role": "user", "parts": [f"DATASET LOKAL:\n{dataset_context}\n\nHafalkan data ini."]},
-                {"role": "model", "parts": ["Siap. Saya sudah menghafal dataset ini."]}
-            ]
-        }
-        # Start new chat with history
-        sessions[session_id]['chat_obj'] = model.start_chat(history=sessions[session_id]['history'])
-
-    current_session = sessions[session_id]
-    chat_obj = current_session['chat_obj']
-
     try:
-        # Prepare message parts
-        message_parts = []
-        if user_input:
-            message_parts.append(user_input)
-        
-        if uploaded_file:
-            # Save temp file to process
-            import tempfile
-            from werkzeug.utils import secure_filename
-            
-            filename = secure_filename(uploaded_file.filename)
-            temp_path = os.path.join(tempfile.gettempdir(), filename)
-            uploaded_file.save(temp_path)
-            
-            # Upload to Gemini
-            print(f"[UPLOAD] Uploading {filename} to Gemini...")
-            gemini_file = genai.upload_file(temp_path)
-            message_parts.append(gemini_file)
-            
-            # Wait for processing if video (usually fast for images)
-            # time.sleep(1) 
+        # Support both JSON (text-only) and multipart/form-data (with file)
+        message = ''
+        use_scholar = False
 
-        # --- LAYER 1 CHECK ---
-        # response = chat_obj.send_message(message_parts)
-        response = generate_with_retry(chat_obj.send_message, message_parts)
-        answer = response.text.strip()
-        
-        # Track pertanyaan pertama untuk konteks follow-up
-        if current_session["conversation_count"] == 0:
-            current_session["first_question"] = user_input
-            current_session["first_answer"] = answer if "SEARCH_EXTERNAL" not in answer else "[Mencari di external sources...]"
-        current_session["conversation_count"] += 1
-        
-        if "SEARCH_EXTERNAL" in answer:
-            # --- LAYER 2 TRIGGER ---
-            external_result = search_semantic_scholar(user_input, current_session)
-            
-            if "Gagal" in external_result or "Tidak ditemukan" in external_result:
-                # --- LAYER 3: FALLBACK GENERAL KNOWLEDGE ---
-                fallback_prompt = f"""
-                PERTANYAAN: {user_input}
-                
-                KONDISI: Data lokal tidak ada, dan akses jurnal ilmiah gagal/kosong.
-                
-                TUGAS: Jawab pertanyaan ini berdasarkan pengetahuan umum agrikultur Anda sebagai AI.
-                
-                PERINGATAN: Awali jawaban dengan "[Disclaimer: Jawaban ini berdasarkan pengetahuan umum AI, bukan jurnal spesifik karena gangguan koneksi/data]."
-                """
-                # fallback_response = chat_obj.send_message(fallback_prompt)
-                fallback_response = generate_with_retry(chat_obj.send_message, fallback_prompt)
-                final_answer = fallback_response.text
+        if request.content_type and request.content_type.startswith('multipart/form-data'):
+            # form with possible file
+            message = request.form.get('message', '').strip()
+            use_scholar = request.form.get('use_scholar', 'false').lower() == 'true'
+
+            # Handle file if present
+            file = request.files.get('file')
+            file_url = None
+            if file and file.filename:
+                # Pass the FileStorage object so allowed_file can check mimetype (image/*)
+                if allowed_file(file):
+                    filename = secure_filename(f"{int(time.time())}_{file.filename}")
+                    save_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+                    file.save(save_path)
+                    # Build URL for the saved file
+                    file_url = url_for('uploaded_file', filename=filename, _external=False)
+                else:
+                    return jsonify({'success': False, 'response': 'Tipe file tidak diizinkan'}), 400
+
+            # If the uploaded file is a zip, optionally list its contents (do not extract)
+            zip_contents = None
+            try:
+                if file_url and filename.lower().endswith('.zip'):
+                    try:
+                        with zipfile.ZipFile(save_path, 'r') as zf:
+                            # Limit list to first 200 entries to avoid huge responses
+                            zip_contents = zf.namelist()[:200]
+                    except Exception as ze:
+                        logger.warning(f"Gagal membaca zip contents: {ze}")
+
+            if not message and not file_url:
+                return jsonify({'success': False, 'response': 'Pesan atau file harus disertakan'}), 400
+
+            # If file uploaded, prepend a note to message so the chatbot can consider it if needed
+            if file_url:
+                message = f"[FILE_UPLOADED:{file_url}] {message}"
+
+            result = chatbot.get_response(message, use_scholar=use_scholar)
+            # Include file metadata in response
+            if zip_contents is not None:
+                result.update({'file_url': file_url, 'zip_contents': zip_contents})
             else:
-                # Inject external synthesis into chat history
-                try:
-                    # chat_obj.send_message(f"[EXTERNAL_SUMMARY]\n{external_result}\nGunakan ini sebagai konteks untuk pertanyaan berikutnya.")
-                    generate_with_retry(chat_obj.send_message, f"[EXTERNAL_SUMMARY]\n{external_result}\nGunakan ini sebagai konteks untuk pertanyaan berikutnya.")
-                except Exception as e:
-                    print(f"[WARN] Gagal menyuntikkan eksternal ke history: {e}")
-
-                final_answer = external_result
+                result.update({'file_url': file_url})
+            return jsonify(result)
         else:
-            # Local Answer
-            final_answer = answer
-            
-        return jsonify({"response": final_answer})
+            data = request.get_json()
+            if not data:
+                return jsonify({
+                    'success': False,
+                    'response': 'Request body kosong'
+                }), 400
 
+            message = data.get('message', '').strip()
+            use_scholar = data.get('use_scholar', False)
+
+            if not message:
+                return jsonify({
+                    'success': False,
+                    'response': 'Pesan tidak boleh kosong'
+                }), 400
+
+            result = chatbot.get_response(message, use_scholar=use_scholar)
+            return jsonify(result)
+        
     except Exception as e:
-        print(f"Error processing chat: {e}")
-        return jsonify({"error": str(e)}), 500
+        logger.error(f"Error di /api/chat: {str(e)}")
+        return jsonify({
+            'success': False,
+            'response': f'Terjadi kesalahan server: {str(e)}'
+        }), 500
 
-def init_app():
-    global model, dataset_context
-    check_dependencies()
-    # genai.configure(api_key=API_KEY)
-    genai.configure(api_key=API_KEYS[0]) # Use first key default
-    
-    print("[LAYER 1] Memuat Database Lokal (MySQL)...", end='')
-    dataset_context = load_from_mysql()
-    print(" Selesai.")
 
+@app.route('/uploads/<path:filename>')
+def uploaded_file(filename):
     try:
-        model = genai.GenerativeModel(
-            model_name=MODEL_NAME,
-            system_instruction=SYSTEM_INSTRUCTION
-        )
-        print("[READY] Model initialized.")
-    except Exception as e:
-        print(f"\n[FATAL] Gagal init model: {e}")
-        sys.exit(1)
+        return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
+    except FileNotFoundError:
+        return jsonify({'error': 'File tidak ditemukan'}), 404
 
-if __name__ == "__main__":
-    init_app()
-    app.run(debug=True, host='0.0.0.0', port=5000)
+
+@app.route('/api/history', methods=['GET'])
+def get_history():
+    if not chatbot:
+        return jsonify({'error': 'Chatbot belum diinisialisasi'}), 500
+    
+    return jsonify({
+        'success': True,
+        'history': chatbot.chat_history,
+        'conversation_memory': chatbot.conversation_memory,
+        'total_chats': len(chatbot.chat_history),
+        'memory_length': len(chatbot.conversation_memory)
+    })
+
+
+@app.route('/api/history', methods=['DELETE'])
+def clear_history():
+    if not chatbot:
+        return jsonify({'error': 'Chatbot belum diinisialisasi'}), 500
+    
+    try:
+        chatbot.clear_history()
+        return jsonify({
+            'success': True,
+            'message': 'Riwayat chat dan memory berhasil dihapus'
+        })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/export', methods=['GET'])
+def export_history():
+    if not chatbot:
+        return jsonify({'error': 'Chatbot belum diinisialisasi'}), 500
+    
+    try:
+        filename = chatbot.export_history()
+        return jsonify({
+            'success': True,
+            'message': f'Riwayat berhasil diexport ke {filename}',
+            'filename': filename
+        })
+    except Exception as e:
+        logger.error(f"Error export: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/status', methods=['GET'])
+def status():
+    available_models = []
+    if chatbot:
+        available_models = chatbot.get_available_models()
+    
+    return jsonify({
+        'success': True,
+        'status': 'online',
+        'chatbot_ready': chatbot is not None,
+        'api_key_configured': GEMINI_API_KEY is not None,
+        'total_chats': len(chatbot.chat_history) if chatbot else 0,
+        'memory_length': len(chatbot.conversation_memory) if chatbot else 0,
+        'available_models': available_models[:5],
+        'timestamp': datetime.now().isoformat()
+    })
+
+
+@app.errorhandler(404)
+def not_found(e):
+    return jsonify({'error': 'Endpoint tidak ditemukan'}), 404
+
+
+@app.errorhandler(500)
+def internal_error(e):
+    return jsonify({'error': 'Internal server error'}), 500
+
+
+if __name__ == '__main__':
+    print("\n" + "=" * 60)
+    print("SMARTANI - CHATBOT PERTANIAN AI (Enhanced)")
+    print("=" * 60)
+    print(f"Server: http://localhost:5001")
+    print(f"API Key: {'✓ OK' if GEMINI_API_KEY else '✗ NOT FOUND'}")
+    print(f"Model: {chatbot.model_name if chatbot else 'Not initialized'}")
+    print(f"CORS: Enabled")
+    print(f"Features: Memory ✓ | Clean Format ✓ | Friendly Tone ✓")
+    print("=" * 60)
+    print("\nEndpoints:")
+    print("  GET  /              - Serve smartani.html")
+    print("  POST /api/chat      - Kirim pesan ke chatbot")
+    print("  GET  /api/history   - Lihat riwayat chat + memory")
+    print("  DELETE /api/history - Hapus riwayat chat + memory")
+    print("  GET  /api/export    - Export riwayat ke JSON")
+    print("  GET  /api/status    - Cek status server")
+    print("=" * 60 + "\n")
+    
+    if not GEMINI_API_KEY:
+        print("⚠ WARNING: GEMINI_API_KEY tidak ditemukan!")
+        print("Buat file .env dan tambahkan: GEMINI_API_KEY=your_key\n")
+    
+    app.run(host='0.0.0.0', port=5001, debug=True)

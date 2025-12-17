@@ -422,17 +422,34 @@
 
             <!-- Input Area -->
             <div class="input-container">
-                <input type="file" id="fileInput" style="display: none;" accept="image/*,application/pdf">
+                <input type="file" id="fileInput" style="display: none;" accept="image/*,video/*,application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-powerpoint,application/vnd.openxmlformats-officedocument.presentationml.presentation,text/plain,application/rtf,application/vnd.oasis.opendocument.text,application/zip">
                 <button class="camera-btn" id="uploadBtn" title="Upload File">
                     <span style="font-size: 24px; color: white;">+</span>
                 </button>
                 <div class="input-wrapper">
-                    <div id="filePreview" style="display: none; font-size: 0.8em; color: #5cb85c; margin-bottom: 5px;">
-                        <span id="fileName"></span> <span id="removeFile"
-                            style="cursor: pointer; color: red;">(x)</span>
+                    <div id="filePreview" style="display: none; font-size: 0.8em; color: #5cb85c; margin-bottom: 5px; display:flex; align-items:center; gap:8px;">
+                        <img id="fileThumb" src="" alt="thumb" style="max-width:64px; max-height:64px; display:none; border-radius:6px; object-fit:cover;" />
+                        <video id="fileVideo" controls style="max-width:160px; max-height:120px; display:none; border-radius:6px; background:#000"></video>
+                        <span id="fileIcon" style="display:none; font-size:1.1em;">📄</span>
+                        <span id="fileName"></span> <span id="removeFile" style="cursor: pointer; color: red;">(x)</span>
+                    </div>
+                    <div id="interimContainer" style="display:none; font-size:0.9em; color:#666; margin-bottom:6px;">
+                        🎧 <span id="interimTranscript"></span>
                     </div>
                     <input type="text" class="input-field" id="questionInput"
                         placeholder="Tanyakan Tentang Pertanian.........." autocomplete="off">
+                </div>
+                <div id="voice-controls" style="display:flex;flex-direction:column;gap:4px;margin-left:8px;">
+                    <select id="langSelect" title="Pilih bahasa" style="font-size:0.85em;padding:6px;border-radius:8px;border:1px solid #ddd;background:#fff;">
+                        <option value="id-ID">Bahasa Indonesia (id-ID)</option>
+                        <option value="en-US">English (en-US)</option>
+                    </select>
+                    <label style="font-size:0.8em;color:#333;display:flex;align-items:center;gap:6px;">
+                        <input type="checkbox" id="autoSendCheckbox"> Auto-send
+                    </label>
+                    <label style="font-size:0.8em;color:#333;display:flex;align-items:center;gap:6px;">
+                        <input type="checkbox" id="continuousCheckbox"> Continuous
+                    </label>
                 </div>
                 <button class="mic-btn" id="micBtn" title="Voice Command">
                     <!-- Icon Mic Sederhana -->
@@ -457,179 +474,596 @@
         const fileNameSpan = document.getElementById('fileName');
         const removeFileSpan = document.getElementById('removeFile');
         const micBtn = document.getElementById('micBtn');
-
+    
         let sessionId = 'session_' + Date.now();
         let selectedFile = null;
-
+        let currentLoadingId = null;
+        const MAX_FILE_SIZE = 20 * 1024 * 1024; // 20MB
+        // Accept any image/* and video/*; explicitly allow common document mime types
+        const EXTRA_ALLOWED_MIME = [
+            'application/pdf',
+            'application/msword',
+            'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+            'application/vnd.ms-excel',
+            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            'application/vnd.ms-powerpoint',
+            'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+            'text/plain',
+            'application/rtf',
+            'application/vnd.oasis.opendocument.text',
+            'application/zip',
+            'application/x-zip-compressed',
+            'application/x-zip',
+            'multipart/x-zip'
+        ];
+        let selectedObjectUrl = null; // for video previews
+    
         function switchToChat() {
             welcomeScreen.style.display = 'none';
             chatContainer.style.display = 'flex';
         }
-
+    
         function appendMessage(text, type) {
             const msgDiv = document.createElement('div');
             msgDiv.className = `message ${type}-message`;
-
+    
             // Simple URL linking
             const urlRegex = /(https?:\/\/[^\s]+)/g;
             const formattedText = text.replace(urlRegex, '<a href="$1" target="_blank" style="color: inherit; text-decoration: underline;">$1</a>');
-
+    
             msgDiv.innerHTML = formattedText;
             chatContainer.appendChild(msgDiv);
             chatContainer.scrollTop = chatContainer.scrollHeight;
         }
-
-        function showLoading() {
+    
+        function showLoading(estimateSeconds) {
+            // Hapus loading sebelumnya jika ada
+            removeLoading();
+            
             const loadingDiv = document.createElement('div');
             loadingDiv.className = 'message bot-message loading-message';
-            loadingDiv.innerHTML = '<div class="loading-dots"><span></span><span></span><span></span></div>';
+            currentLoadingId = 'loading-' + Date.now();
+            loadingDiv.id = currentLoadingId;
+            loadingDiv.innerHTML = '<div style="display:flex;align-items:center;gap:12px;"><div class="loading-dots"><span></span><span></span><span></span></div><div id="' + currentLoadingId + '-countdown" style="font-size:0.95em;color:#666;">Estimasi: --:--</div></div>';
             chatContainer.appendChild(loadingDiv);
             chatContainer.scrollTop = chatContainer.scrollHeight;
+            // Start a countdown using provided estimate or default
+            startLoadingCountdown(typeof estimateSeconds === 'number' ? estimateSeconds : 10);
             return loadingDiv;
         }
+    
+        function removeLoading() {
+            if (currentLoadingId) {
+                const loadingElement = document.getElementById(currentLoadingId);
+                if (loadingElement && loadingElement.parentNode) {
+                    loadingElement.remove();
+                }
+                currentLoadingId = null;
+            }
+            
+            // Juga hapus semua loading elements lain yang mungkin tersisa
+            const allLoadingElements = document.querySelectorAll('.loading-message');
+            allLoadingElements.forEach(el => {
+                if (el.parentNode === chatContainer) {
+                    el.remove();
+                }
+            });
 
+            // Clear countdown interval if any
+            if (window.currentLoadingInterval) {
+                clearInterval(window.currentLoadingInterval);
+                window.currentLoadingInterval = null;
+            }
+        }
+
+
+        // Countdown helper: starts/resets countdown in seconds
+        function startLoadingCountdown(seconds) {
+            // clear existing
+            if (window.currentLoadingInterval) {
+                clearInterval(window.currentLoadingInterval);
+                window.currentLoadingInterval = null;
+            }
+
+            let remaining = Math.max(0, Math.floor(seconds));
+            const updateElement = () => {
+                if (!currentLoadingId) return;
+                const el = document.getElementById(currentLoadingId + '-countdown');
+                if (!el) return;
+                const mm = String(Math.floor(remaining / 60)).padStart(2, '0');
+                const ss = String(remaining % 60).padStart(2, '0');
+                el.textContent = `Estimasi: ${mm}:${ss}`;
+            };
+
+            updateElement();
+            window.currentLoadingInterval = setInterval(() => {
+                remaining = Math.max(0, remaining - 1);
+                updateElement();
+                if (remaining <= 0) {
+                    // after countdown ends, show waiting text
+                    const el = document.getElementById(currentLoadingId + '-countdown');
+                    if (el) el.textContent = 'Masih memproses...';
+                    clearInterval(window.currentLoadingInterval);
+                    window.currentLoadingInterval = null;
+                }
+            }, 1000);
+        }
+
+        // Upload with progress using XHR, returns an object similar to fetch Response
+        function uploadWithProgress(url, file, message) {
+            return new Promise((resolve, reject) => {
+                const xhr = new XMLHttpRequest();
+                const form = new FormData();
+                form.append('message', message || '');
+                form.append('session_id', sessionId);
+                form.append('file', file);
+
+                xhr.open('POST', url, true);
+
+                xhr.upload.onprogress = function(e) {
+                    const percent = e.lengthComputable ? Math.round((e.loaded / e.total) * 100) : null;
+                    if (currentLoadingId) {
+                        const el = document.getElementById(currentLoadingId);
+                        if (el) {
+                            el.innerHTML = `<div style="font-size:0.9em; color:#666">Uploading... ${percent ? percent + '%' : ''}</div>`;
+                        }
+                    }
+                };
+
+                xhr.onload = function() {
+                    const status = xhr.status;
+                    const ok = status >= 200 && status < 300;
+                    const resText = xhr.responseText || '{}';
+                    const fakeResponse = {
+                        ok: ok,
+                        status: status,
+                        json: async () => JSON.parse(resText)
+                    };
+                    if (ok) resolve(fakeResponse);
+                    else reject(new Error('Upload failed: ' + status));
+                };
+
+                xhr.onerror = function() {
+                    reject(new Error('Network error during upload'));
+                };
+
+                xhr.send(form);
+            });
+        }
+    
+        function displayBotResponse(text, confidence, sources, processing_time) {
+            const msgDiv = document.createElement('div');
+            msgDiv.className = 'message bot-message';
+    
+            // Simple URL linking
+            const urlRegex = /(https?:\/\/[^\s]+)/g;
+            let formattedText = text.replace(urlRegex, '<a href="$1" target="_blank" style="color: inherit; text-decoration: underline;">$1</a>');
+    
+            // Tambahkan metadata jika ada confidence score
+            if (confidence !== undefined || processing_time !== undefined) {
+                let confidenceColor = '#5cb85c'; // green
+                let confidenceText = 'Tinggi';
+                
+                if (confidence < 0.3) {
+                    confidenceColor = '#d9534f'; // red
+                    confidenceText = 'Rendah';
+                } else if (confidence < 0.6) {
+                    confidenceColor = '#f0ad4e'; // orange
+                    confidenceText = 'Sedang';
+                }
+                
+                formattedText += `<br><br>
+                    <div style="font-size: 0.85em; margin-top: 12px; padding-top: 10px; border-top: 1px dashed #ddd; color: #666; display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
+                        ${confidence !== undefined ? `<span style="color: ${confidenceColor}; font-weight: bold;">🔍 Relevansi: ${confidenceText} (${(confidence * 100).toFixed(0)}%)</span>` : ''}
+                        ${processing_time !== undefined ? `<span style="color:#666">⏱️ Waktu proses: ${processing_time}s</span>` : ''}
+                        ${sources && sources.length > 0 ? `<span style="margin-left: 6px; color:#666">📊 Sumber data: ${sources.length}</span>` : ''}
+                    </div>`;
+            }
+    
+            msgDiv.innerHTML = formattedText;
+            chatContainer.appendChild(msgDiv);
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+        }
+    
         // File Upload Handling
         uploadBtn.addEventListener('click', () => fileInput.click());
-
+    
         fileInput.addEventListener('change', (e) => {
             if (e.target.files.length > 0) {
-                selectedFile = e.target.files[0];
+                const f = e.target.files[0];
+
+                // Validate type and size: accept image/*, video/* or explicit extra types (e.g., PDF/docs)
+                    if (!(f.type && (f.type.startsWith('image/') || f.type.startsWith('video/'))) && !EXTRA_ALLOWED_MIME.includes(f.type)) {
+                    alert('Tipe file tidak didukung. Gunakan gambar, video, atau dokumen yang umum (PDF, DOCX, XLSX, dll).');
+                    fileInput.value = '';
+                    return;
+                }
+                if (f.size > MAX_FILE_SIZE) {
+                    alert('Ukuran file terlalu besar. Maksimum 20MB.');
+                    fileInput.value = '';
+                    return;
+                }
+
+                selectedFile = f;
                 fileNameSpan.textContent = selectedFile.name;
-                filePreview.style.display = 'block';
+                filePreview.style.display = 'flex';
+
+                // Reset previews
+                const thumb = document.getElementById('fileThumb');
+                const videoEl = document.getElementById('fileVideo');
+                const fileIcon = document.getElementById('fileIcon');
+                // Revoke previous object URL
+                if (selectedObjectUrl) {
+                    URL.revokeObjectURL(selectedObjectUrl);
+                    selectedObjectUrl = null;
+                }
+
+                if (f.type.startsWith('image/')) {
+                    // Show image thumbnail
+                    const reader = new FileReader();
+                    reader.onload = function(evt) {
+                        thumb.src = evt.target.result;
+                        thumb.style.display = 'block';
+                        videoEl.style.display = 'none';
+                        fileIcon.style.display = 'none';
+                    };
+                    reader.readAsDataURL(f);
+                } else if (f.type.startsWith('video/')) {
+                    // Show video preview via object URL
+                    selectedObjectUrl = URL.createObjectURL(f);
+                    videoEl.src = selectedObjectUrl;
+                    videoEl.style.display = 'block';
+                    thumb.style.display = 'none';
+                    fileIcon.style.display = 'none';
+                } else {
+                    // Document: show icon
+                    thumb.style.display = 'none';
+                    videoEl.style.display = 'none';
+                    fileIcon.style.display = 'inline-block';
+                }
             }
         });
-
+    
         removeFileSpan.addEventListener('click', () => {
             selectedFile = null;
             fileInput.value = '';
             filePreview.style.display = 'none';
+            // Revoke object URL if any
+            if (selectedObjectUrl) {
+                try { URL.revokeObjectURL(selectedObjectUrl); } catch (e) {}
+                selectedObjectUrl = null;
+            }
+            // Reset preview elements
+            const thumb = document.getElementById('fileThumb');
+            const videoEl = document.getElementById('fileVideo');
+            const fileIcon = document.getElementById('fileIcon');
+            thumb.src = ''; thumb.style.display = 'none';
+            videoEl.src = ''; videoEl.style.display = 'none';
+            fileIcon.style.display = 'none';
         });
-
+    
         async function sendMessage(text) {
             if (!text.trim() && !selectedFile) return;
-
+    
             // Check if running from file
             if (window.location.protocol === 'file:') {
                 alert("PERINGATAN: Anda membuka file ini langsung. Mohon jalankan 'python app.py' dan buka 'http://localhost:5000' di browser untuk fungsi penuh.");
+                return;
             }
-
+    
             switchToChat();
-
+    
             let displayMsg = text;
             if (selectedFile) {
                 displayMsg = `[File: ${selectedFile.name}]<br>${text}`;
             }
             appendMessage(displayMsg, 'user');
-
+    
             questionInput.value = '';
-            // Don't clear file immediately if we want to support retries, but standard chat usually clears
             const currentFile = selectedFile;
-
+    
             // Clear input UI
             selectedFile = null;
             fileInput.value = '';
             filePreview.style.display = 'none';
-
-            const loadingDiv = showLoading();
-
+    
+            // Compute an estimated response time (seconds). Base 5s + 2s per MB if file present.
+            let estimate = 10;
+            if (currentFile) {
+                const sizeMB = currentFile.size / (1024 * 1024);
+                estimate = Math.min(60, Math.max(5, Math.round(5 + 2 * sizeMB)));
+            }
+            const loadingDiv = showLoading(estimate);
+    
             try {
-                // Determine API URL
-                let apiUrl = '/api/chat';
-                if (window.location.protocol === 'file:') {
-                    apiUrl = 'http://127.0.0.1:5000/api/chat';
+                    // Determine API URL
+                    let apiUrl = '/api/chat';
+                    if (window.location.protocol === 'file:') {
+                        apiUrl = 'http://127.0.0.1:5001/api/chat';
+                    }
+
+                    // Gunakan JSON untuk teks biasa
+                    let response;
+                    if (currentFile) {
+                        // Jika ada file, gunakan XHR untuk progress
+                        response = await uploadWithProgress(apiUrl, currentFile, text);
+                    } else {
+                        // Jika hanya teks, gunakan JSON
+                        response = await fetch(apiUrl, {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json'
+                            },
+                            body: JSON.stringify({
+                                message: text,
+                                session_id: sessionId
+                            })
+                        });
+                    }
+    
+                // Check if response is ok
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
                 }
-
-                // Use FormData for file upload
-                const formData = new FormData();
-                formData.append('message', text);
-                formData.append('session_id', sessionId);
-                if (currentFile) {
-                    formData.append('file', currentFile);
-                }
-
-                const response = await fetch(apiUrl, {
-                    method: 'POST',
-                    body: formData // Fetch automatically sets Content-Type to multipart/form-data
-                });
-
+    
                 const data = await response.json();
-
-                // Remove loading
-                chatContainer.removeChild(loadingDiv);
-
+    
+                // Remove loading dengan aman
+                removeLoading();
+    
                 if (data.error) {
                     appendMessage('Maaf, terjadi kesalahan: ' + data.error, 'bot');
                 } else {
-                    appendMessage(data.response, 'bot');
-                }
+                    // Jika server mengembalikan file_url, tampilkan preview/link
+                    if (data.file_url) {
+                        try {
+                            const fileDiv = document.createElement('div');
+                            fileDiv.className = 'message bot-message';
+                            const lower = data.file_url.toLowerCase();
+                            const videoExts = ['.mp4', '.webm', '.ogg', '.mov', '.mkv'];
+                            const imageExts = ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.svg'];
+                            const docExts = ['.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.txt', '.csv', '.rtf', '.odt', '.zip'];
 
+                            const isVideo = videoExts.some(ext => lower.endsWith(ext));
+                            const isImage = imageExts.some(ext => lower.endsWith(ext));
+                            const isDoc = docExts.some(ext => lower.endsWith(ext));
+
+                            if (isVideo) {
+                                fileDiv.innerHTML = `<video controls style="max-width:320px;border-radius:8px;background:#000;display:block;margin-bottom:8px;">
+                                    <source src="${data.file_url}"></source>
+                                </video>
+                                <a href="${data.file_url}" target="_blank">Buka video</a>`;
+                            } else if (isImage) {
+                                fileDiv.innerHTML = `<div style="display:flex;align-items:center;gap:10px;"><img src="${data.file_url}" style="max-width:160px;border-radius:8px;object-fit:cover;" alt="upload" /><a href="${data.file_url}" target="_blank">Buka file</a></div>`;
+                            } else if (lower.endsWith('.pdf')) {
+                                fileDiv.innerHTML = `<a href="${data.file_url}" target="_blank">📄 PDF terupload: Klik untuk buka</a>`;
+                            } else if (isDoc) {
+                                fileDiv.innerHTML = `<a href="${data.file_url}" target="_blank">📄 File terupload: ${data.file_url.split('/').pop()}</a>`;
+                            } else {
+                                // fallback: link
+                                fileDiv.innerHTML = `<a href="${data.file_url}" target="_blank">File terupload: Klik untuk buka</a>`;
+                            }
+
+                            chatContainer.appendChild(fileDiv);
+                            // If server returned zip contents, show them as a compact list
+                            if (data.zip_contents && Array.isArray(data.zip_contents) && data.zip_contents.length > 0) {
+                                try {
+                                    const listDiv = document.createElement('div');
+                                    listDiv.className = 'message bot-message';
+                                    const safeNames = data.zip_contents.slice(0, 50).map(n => n.replace(/</g, '&lt;').replace(/>/g, '&gt;'));
+                                    listDiv.innerHTML = `<strong>Isi file ZIP (${safeNames.length} item):</strong><br><ol style="margin-top:6px;max-height:200px;overflow:auto;">${safeNames.map(n => `<li>${n}</li>`).join('')}</ol>`;
+                                    chatContainer.appendChild(listDiv);
+                                } catch (err) {
+                                    console.warn('Gagal menampilkan isi zip:', err);
+                                }
+                            }
+                        } catch (err) {
+                            console.warn('Gagal menampilkan preview file:', err);
+                        }
+                    }
+
+                    // Gunakan fungsi displayBotResponse untuk menampilkan response dengan metadata
+                    displayBotResponse(data.response, data.confidence, data.sources, data.processing_time);
+                }
+    
             } catch (error) {
-                chatContainer.removeChild(loadingDiv);
-                appendMessage('Maaf, tidak dapat terhubung ke server. Pastikan Anda sudah menjalankan "python app.py" di terminal.', 'bot');
                 console.error('Error:', error);
+                
+                // Remove loading dengan aman
+                removeLoading();
+                
+                // Tampilkan pesan error yang lebih spesifik
+                let errorMessage = 'Maaf, tidak dapat terhubung ke server. ';
+                
+                if (error.message.includes('Failed to fetch')) {
+                    errorMessage += 'Pastikan server Flask berjalan di terminal.';
+                } else if (error.message.includes('NetworkError')) {
+                    errorMessage += 'Ada masalah jaringan.';
+                } else {
+                    errorMessage += `Error: ${error.message}`;
+                }
+                
+                appendMessage(errorMessage, 'bot');
             }
         }
-
+    
         function sendSuggestion(text) {
             sendMessage(text);
         }
-
+    
         // Event Listeners
-        sendBtn.addEventListener('click', () => sendMessage(questionInput.value));
-
-        questionInput.addEventListener('keypress', (e) => {
-            if (e.key === 'Enter') {
-                sendMessage(questionInput.value);
+        sendBtn.addEventListener('click', () => {
+            const text = questionInput.value.trim();
+            if (text) {
+                sendMessage(text);
             }
         });
-
+    
+        questionInput.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') {
+                const text = questionInput.value.trim();
+                if (text) {
+                    sendMessage(text);
+                }
+            }
+        });
+    
         // Voice Command Logic
         const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
 
         if (SpeechRecognition) {
             const recognition = new SpeechRecognition();
-            recognition.lang = 'id-ID'; // Bahasa Indonesia
-            recognition.interimResults = false;
+            // Start with interim results enabled so we can show live transcript
+            recognition.interimResults = true;
             recognition.maxAlternatives = 1;
+
+            const langSelect = document.getElementById('langSelect');
+            const autoSendCheckbox = document.getElementById('autoSendCheckbox');
+            const continuousCheckbox = document.getElementById('continuousCheckbox');
+            const interimContainer = document.getElementById('interimContainer');
+            const interimTranscript = document.getElementById('interimTranscript');
+
+            function startRecognition() {
+                recognition.lang = langSelect.value || 'id-ID';
+                recognition.continuous = !!continuousCheckbox.checked;
+                interimTranscript.textContent = '';
+                interimContainer.style.display = 'block';
+                try {
+                    recognition.start();
+                    micBtn.classList.add('listening');
+                    micBtn.setAttribute('aria-pressed', 'true');
+                } catch (error) {
+                    console.error('Speech recognition start error:', error);
+                }
+            }
+
+            function stopRecognition() {
+                try {
+                    recognition.stop();
+                } catch (err) {
+                    console.warn('Stop recognition error', err);
+                }
+                interimContainer.style.display = 'none';
+                micBtn.classList.remove('listening');
+                micBtn.setAttribute('aria-pressed', 'false');
+            }
 
             micBtn.addEventListener('click', () => {
                 if (micBtn.classList.contains('listening')) {
-                    recognition.stop();
+                    stopRecognition();
                 } else {
-                    recognition.start();
+                    startRecognition();
+                }
+            });
+
+            // Keyboard shortcut: Ctrl+M to toggle
+            document.addEventListener('keydown', (e) => {
+                if (e.ctrlKey && (e.key === 'm' || e.key === 'M')) {
+                    e.preventDefault();
+                    micBtn.click();
                 }
             });
 
             recognition.onstart = () => {
-                micBtn.classList.add('listening');
-                questionInput.placeholder = "Mendengarkan...";
+                questionInput.placeholder = "🎤 Mendengarkan...";
             };
 
             recognition.onend = () => {
-                micBtn.classList.remove('listening');
-                questionInput.placeholder = "Tanyakan Tentang Pertanian..........";
+                // If continuous mode is on, restart automatically
+                if (continuousCheckbox.checked) {
+                    setTimeout(() => {
+                        try {
+                            recognition.start();
+                        } catch (e) {}
+                    }, 200);
+                } else {
+                    stopRecognition();
+                    questionInput.placeholder = "Tanyakan Tentang Pertanian..........";
+                }
             };
 
             recognition.onresult = (event) => {
-                const transcript = event.results[0][0].transcript;
-                questionInput.value = transcript;
-                // Optional: Auto send after voice
-                // sendMessage(transcript); 
+                let interim = '';
+                let finalTranscript = '';
+
+                for (let i = event.resultIndex; i < event.results.length; ++i) {
+                    const res = event.results[i];
+                    if (res.isFinal) {
+                        finalTranscript += res[0].transcript;
+                    } else {
+                        interim += res[0].transcript;
+                    }
+                }
+
+                // Show interim transcript visually
+                if (interim) {
+                    interimTranscript.textContent = interim;
+                    interimContainer.style.display = 'block';
+                } else {
+                    interimTranscript.textContent = '';
+                }
+
+                if (finalTranscript) {
+                    // Put final transcript into input
+                    questionInput.value = finalTranscript.trim();
+                    interimTranscript.textContent = '';
+                    interimContainer.style.display = 'none';
+
+                    // Auto-send only if enabled
+                    if (autoSendCheckbox.checked) {
+                        setTimeout(() => {
+                            if (questionInput.value.trim()) {
+                                sendMessage(questionInput.value);
+                            }
+                        }, 200);
+                    }
+                }
             };
 
             recognition.onerror = (event) => {
                 console.error('Speech recognition error', event.error);
-                micBtn.classList.remove('listening');
-                questionInput.placeholder = "Error mic. Coba ketik manual.";
+                // Show helpful placeholder message
+                questionInput.placeholder = "🎤 Error mic. Coba ketik manual.";
                 setTimeout(() => {
                     questionInput.placeholder = "Tanyakan Tentang Pertanian..........";
                 }, 3000);
+                stopRecognition();
             };
+
+            // Reflect control changes live
+            langSelect.addEventListener('change', () => {
+                if (micBtn.classList.contains('listening')) {
+                    // restart recognition to apply new language
+                    stopRecognition();
+                    startRecognition();
+                }
+            });
+
+            continuousCheckbox.addEventListener('change', () => {
+                if (micBtn.classList.contains('listening')) {
+                    stopRecognition();
+                    startRecognition();
+                }
+            });
+
         } else {
+            // Hide mic button and voice controls if not supported
             micBtn.style.display = 'none';
+            const vc = document.getElementById('voice-controls');
+            if (vc) vc.style.display = 'none';
             console.log("Web Speech API not supported in this browser.");
         }
+    
+        // Tambahkan event listener untuk DOMContentLoaded
+        document.addEventListener('DOMContentLoaded', function() {
+            console.log('SMARTANI AI Chat loaded successfully');
+            
+            // Test jika elemen penting ada
+            if (!questionInput || !sendBtn || !chatContainer) {
+                console.error('Required elements not found!');
+            }
+            
+            // Focus ke input field
+            questionInput.focus();
+        });
     </script>
-</body>
-
-</html>
